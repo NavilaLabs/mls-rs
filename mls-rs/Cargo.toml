@@ -103,7 +103,7 @@ rand = "0.10"
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
 hex = { version = "^0.4.3", default-features = false, features = ["serde", "alloc"] }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = { version = "0.2" }
 getrandom = { version = "0.4", features = ["wasm_js"], default-features = false }
 rand_core = "0.10"
