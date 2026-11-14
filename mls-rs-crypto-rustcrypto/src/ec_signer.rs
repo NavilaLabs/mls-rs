@@ -7,6 +7,7 @@ use crate::ec::{
     pub_key_from_uncompressed, sign_ed25519, sign_p256, sign_p384, verify_ed25519, verify_p256,
     verify_p384, EcError, EcPrivateKey, EcPublicKey,
 };
+use crate::random::{RandomSource, SystemRandom};
 use alloc::vec::Vec;
 use core::ops::Deref;
 use mls_rs_core::crypto::{CipherSuite, SignaturePublicKey, SignatureSecretKey};
@@ -52,7 +53,15 @@ impl EcSigner {
     pub fn signature_key_generate(
         &self,
     ) -> Result<(SignatureSecretKey, SignaturePublicKey), EcSignerError> {
-        let key_pair = generate_keypair(self.0)?;
+        self.signature_key_generate_from(&SystemRandom)
+    }
+
+    /// Generates a signature key pair with randomness drawn from `random`.
+    pub fn signature_key_generate_from<R: RandomSource>(
+        &self,
+        random: &R,
+    ) -> Result<(SignatureSecretKey, SignaturePublicKey), EcSignerError> {
+        let key_pair = generate_keypair(self.0, random)?;
         Ok((key_pair.secret.into(), key_pair.public.into()))
     }
 

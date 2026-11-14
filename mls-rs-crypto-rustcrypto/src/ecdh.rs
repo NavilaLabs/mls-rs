@@ -17,6 +17,7 @@ use crate::ec::{
     generate_keypair, private_key_bytes_to_public, private_key_ecdh, private_key_from_bytes,
     pub_key_from_uncompressed, EcError, EcPublicKey,
 };
+use crate::random::{RandomSource, SystemRandom};
 
 #[derive(Debug)]
 #[cfg_attr(feature = "std", derive(thiserror::Error))]
@@ -40,20 +41,46 @@ impl IntoAnyError for EcdhKemError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Ecdh(Curve);
+/// Diffie-Hellman over the curve of a cipher suite. Generated keys draw their randomness
+/// from `R`.
+#[derive(Clone)]
+pub struct Ecdh<R = SystemRandom> {
+    curve: Curve,
+    random: R,
+}
 
-impl Deref for Ecdh {
+impl<R> core::fmt::Debug for Ecdh<R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Ecdh").field(&self.curve).finish()
+    }
+}
+
+impl<R> PartialEq for Ecdh<R> {
+    fn eq(&self, other: &Self) -> bool {
+        self.curve == other.curve
+    }
+}
+
+impl<R> Eq for Ecdh<R> {}
+
+impl<R> Deref for Ecdh<R> {
     type Target = Curve;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.curve
     }
 }
 
 impl Ecdh {
     pub fn new(cipher_suite: CipherSuite) -> Option<Self> {
-        Curve::from_ciphersuite(cipher_suite, false).map(Self)
+        Self::with_random(cipher_suite, SystemRandom)
+    }
+}
+
+impl<R: RandomSource> Ecdh<R> {
+    /// Like [`Ecdh::new`], but generated keys draw their randomness from `random`.
+    pub fn with_random(cipher_suite: CipherSuite, random: R) -> Option<Self> {
+        Curve::from_ciphersuite(cipher_suite, false).map(|curve| Self { curve, random })
     }
 }
 
@@ -63,7 +90,7 @@ impl Ecdh {
     all(not(target_arch = "wasm32"), mls_build_async),
     maybe_async::must_be_async
 )]
-impl DhType for Ecdh {
+impl<R: RandomSource> DhType for Ecdh<R> {
     type Error = EcdhKemError;
 
     async fn dh(
@@ -72,17 +99,17 @@ impl DhType for Ecdh {
         public_key: &HpkePublicKey,
     ) -> Result<Vec<u8>, Self::Error> {
         Ok(private_key_ecdh(
-            &private_key_from_bytes(secret_key, self.0)?,
+            &private_key_from_bytes(secret_key, self.curve)?,
             &self.to_ec_public_key(public_key)?,
         )?)
     }
 
     async fn to_public(&self, secret_key: &HpkeSecretKey) -> Result<HpkePublicKey, Self::Error> {
-        Ok(private_key_bytes_to_public(secret_key, self.0)?.into())
+        Ok(private_key_bytes_to_public(secret_key, self.curve)?.into())
     }
 
     async fn generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
-        let key_pair = generate_keypair(self.0)?;
+        let key_pair = generate_keypair(self.curve, &self.random)?;
         Ok((key_pair.secret.into(), key_pair.public.into()))
     }
 
@@ -95,17 +122,17 @@ impl DhType for Ecdh {
     }
 
     fn secret_key_size(&self) -> usize {
-        self.0.secret_key_size()
+        self.curve.secret_key_size()
     }
 
     fn public_key_size(&self) -> usize {
-        self.0.public_key_size()
+        self.curve.public_key_size()
     }
 }
 
-impl Ecdh {
+impl<R> Ecdh<R> {
     fn to_ec_public_key(&self, public_key: &HpkePublicKey) -> Result<EcPublicKey, EcdhKemError> {
-        Ok(pub_key_from_uncompressed(public_key, self.0)?)
+        Ok(pub_key_from_uncompressed(public_key, self.curve)?)
     }
 }
 

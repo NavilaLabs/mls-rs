@@ -11,6 +11,7 @@ pub mod ec_signer;
 pub mod ecdh;
 pub mod kdf;
 pub mod mac;
+mod random;
 
 #[cfg(feature = "x509")]
 pub mod x509;
@@ -21,7 +22,6 @@ mod ec_for_x509;
 use crate::aead::Aead;
 use ec_signer::{EcSigner, EcSignerError};
 use ecdh::Ecdh;
-use getrandom::{rand_core::TryRng, SysRng};
 use kdf::Kdf;
 use mac::{Hash, HashError};
 use mls_rs_crypto_hpke::{
@@ -30,6 +30,7 @@ use mls_rs_crypto_hpke::{
     hpke::{Hpke, HpkeError},
 };
 use mls_rs_crypto_traits::{AeadType, KdfType, KemId, KemType};
+pub use random::{RandomSource, SystemRandom};
 
 use mls_rs_core::{
     crypto::{
@@ -94,10 +95,12 @@ impl IntoAnyError for RustCryptoError {
     }
 }
 
+/// Draws its randomness from `R`, the operating system by default.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct RustCryptoProvider {
+pub struct RustCryptoProvider<R = SystemRandom> {
     pub enabled_cipher_suites: Vec<CipherSuite>,
+    random: R,
 }
 
 impl RustCryptoProvider {
@@ -108,6 +111,7 @@ impl RustCryptoProvider {
     pub fn with_enabled_cipher_suites(enabled_cipher_suites: Vec<CipherSuite>) -> Self {
         Self {
             enabled_cipher_suites,
+            random: SystemRandom,
         }
     }
 
@@ -121,16 +125,24 @@ impl RustCryptoProvider {
     }
 }
 
-impl Default for RustCryptoProvider {
-    fn default() -> Self {
-        Self {
-            enabled_cipher_suites: Self::all_supported_cipher_suites(),
+impl<R: RandomSource> RustCryptoProvider<R> {
+    /// Replaces the source every random value of this provider is drawn from.
+    pub fn with_random<S: RandomSource>(self, random: S) -> RustCryptoProvider<S> {
+        RustCryptoProvider {
+            enabled_cipher_suites: self.enabled_cipher_suites,
+            random,
         }
     }
 }
 
-impl CryptoProvider for RustCryptoProvider {
-    type CipherSuiteProvider = RustCryptoCipherSuite<DhKem<Ecdh, Kdf>, Kdf, Aead>;
+impl Default for RustCryptoProvider {
+    fn default() -> Self {
+        Self::with_enabled_cipher_suites(Self::all_supported_cipher_suites())
+    }
+}
+
+impl<R: RandomSource> CryptoProvider for RustCryptoProvider<R> {
+    type CipherSuiteProvider = RustCryptoCipherSuite<DhKem<Ecdh<R>, Kdf>, Kdf, Aead, R>;
 
     fn supported_cipher_suites(&self) -> Vec<CipherSuite> {
         self.enabled_cipher_suites.clone()
@@ -145,17 +157,17 @@ impl CryptoProvider for RustCryptoProvider {
         }
 
         let kdf = Kdf::new(cipher_suite)?;
-        let ecdh = Ecdh::new(cipher_suite)?;
+        let ecdh = Ecdh::with_random(cipher_suite, self.random.clone())?;
         let kem_id = KemId::new(cipher_suite)?;
         let kem = DhKem::new(ecdh, kdf, kem_id as u16, kem_id.n_secret());
         let aead = Aead::new(cipher_suite)?;
 
-        RustCryptoCipherSuite::new(cipher_suite, kem, kdf, aead)
+        RustCryptoCipherSuite::with_random(cipher_suite, kem, kdf, aead, self.random.clone())
     }
 }
 
 #[derive(Clone)]
-pub struct RustCryptoCipherSuite<KEM, KDF, AEAD>
+pub struct RustCryptoCipherSuite<KEM, KDF, AEAD, R = SystemRandom>
 where
     KEM: KemType + Clone,
     KDF: KdfType + Clone,
@@ -167,6 +179,7 @@ where
     hash: Hash,
     hpke: Hpke<KEM, KDF, AEAD>,
     ec_signer: EcSigner,
+    random: R,
 }
 
 impl<KEM, KDF, AEAD> RustCryptoCipherSuite<KEM, KDF, AEAD>
@@ -176,6 +189,26 @@ where
     AEAD: AeadType + Clone,
 {
     pub fn new(cipher_suite: CipherSuite, kem: KEM, kdf: KDF, aead: AEAD) -> Option<Self> {
+        Self::with_random(cipher_suite, kem, kdf, aead, SystemRandom)
+    }
+}
+
+impl<KEM, KDF, AEAD, R> RustCryptoCipherSuite<KEM, KDF, AEAD, R>
+where
+    KEM: KemType + Clone,
+    KDF: KdfType + Clone,
+    AEAD: AeadType + Clone,
+    R: RandomSource,
+{
+    /// Like [`RustCryptoCipherSuite::new`], but every random value is drawn from `random`.
+    /// `kem` draws its own randomness; give it the same source.
+    pub fn with_random(
+        cipher_suite: CipherSuite,
+        kem: KEM,
+        kdf: KDF,
+        aead: AEAD,
+        random: R,
+    ) -> Option<Self> {
         let hpke = Hpke::new(kem, kdf.clone(), Some(aead.clone()));
 
         Some(Self {
@@ -185,11 +218,12 @@ where
             hash: Hash::new(cipher_suite).ok()?,
             hpke,
             ec_signer: EcSigner::new(cipher_suite)?,
+            random,
         })
     }
 
     pub fn random_bytes(&self, out: &mut [u8]) -> Result<(), RustCryptoError> {
-        SysRng.try_fill_bytes(out).map_err(Into::into)
+        self.random.fill_bytes(out).map_err(Into::into)
     }
 }
 
@@ -199,11 +233,12 @@ where
     all(not(target_arch = "wasm32"), mls_build_async),
     maybe_async::must_be_async
 )]
-impl<KEM, KDF, AEAD> CipherSuiteProvider for RustCryptoCipherSuite<KEM, KDF, AEAD>
+impl<KEM, KDF, AEAD, R> CipherSuiteProvider for RustCryptoCipherSuite<KEM, KDF, AEAD, R>
 where
     KEM: KemType + Clone + Send + Sync,
     KDF: KdfType + Clone + Send + Sync,
     AEAD: AeadType + Clone + Send + Sync,
+    R: RandomSource,
 {
     type Error = RustCryptoError;
     // TODO exporter_secret in this struct is not zeroized
@@ -393,7 +428,7 @@ where
     async fn signature_key_generate(
         &self,
     ) -> Result<(SignatureSecretKey, SignaturePublicKey), Self::Error> {
-        Ok(self.ec_signer.signature_key_generate()?)
+        Ok(self.ec_signer.signature_key_generate_from(&self.random)?)
     }
 
     async fn signature_key_derive_public(
@@ -423,4 +458,64 @@ fn mls_core_tests() {
 async fn mls_rs_core_test() {
     let provider = RustCryptoProvider::new();
     mls_rs_core::crypto::test_suite::verify_tests(&provider, true).await;
+}
+
+#[cfg(all(test, not(mls_build_async)))]
+mod random_source_tests {
+    use super::{RandomSource, RustCryptoProvider};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use mls_rs_core::crypto::{CipherSuiteProvider, CryptoProvider};
+
+    #[derive(Clone, Default)]
+    struct ConstantCountingSource(Arc<AtomicUsize>);
+
+    impl ConstantCountingSource {
+        fn drawn(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RandomSource for ConstantCountingSource {
+        fn fill_bytes(&self, out: &mut [u8]) -> Result<(), getrandom::Error> {
+            self.0.fetch_add(out.len(), Ordering::SeqCst);
+            out.fill(7);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_random_value_comes_from_the_source() {
+        for cipher_suite in RustCryptoProvider::all_supported_cipher_suites() {
+            let source = ConstantCountingSource::default();
+            let provider = RustCryptoProvider::new()
+                .with_random(source.clone())
+                .cipher_suite_provider(cipher_suite)
+                .unwrap();
+
+            let before = source.drawn();
+            let (_, first) = provider.kem_generate().unwrap();
+            let (_, second) = provider.kem_generate().unwrap();
+            assert!(source.drawn() > before, "{cipher_suite:?}: kem_generate");
+            assert_eq!(first, second, "{cipher_suite:?}: kem_generate");
+
+            let before = source.drawn();
+            let (_, first) = provider.signature_key_generate().unwrap();
+            let (_, second) = provider.signature_key_generate().unwrap();
+            assert!(
+                source.drawn() > before,
+                "{cipher_suite:?}: signature_key_generate"
+            );
+            assert_eq!(first, second, "{cipher_suite:?}: signature_key_generate");
+
+            let (_, remote) = provider.kem_generate().unwrap();
+            let before = source.drawn();
+            provider.hpke_seal(&remote, b"info", None, b"data").unwrap();
+            assert!(source.drawn() > before, "{cipher_suite:?}: hpke_seal");
+
+            let mut bytes = [0; 16];
+            provider.random_bytes(&mut bytes).unwrap();
+            assert_eq!(bytes, [7; 16], "{cipher_suite:?}: random_bytes");
+        }
+    }
 }

@@ -16,8 +16,10 @@ use core::array::TryFromSliceError;
 
 use core::fmt::{self, Debug};
 use ed25519_dalek::Signer;
-use getrandom::{rand_core::UnwrapErr, SysRng};
+use getrandom::rand_core::UnwrapErr;
 use p256::elliptic_curve::{sec1::ToSec1Point, Generate};
+
+use crate::random::{RandomSource, RandomSourceRng};
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum EcPublicKey {
@@ -122,10 +124,13 @@ pub fn pub_key_to_uncompressed(key: &EcPublicKey) -> Result<Vec<u8>, EcError> {
     }
 }
 
-pub fn generate_private_key(curve: Curve) -> Result<EcPrivateKey, EcError> {
+pub fn generate_private_key<R: RandomSource>(
+    curve: Curve,
+    random: &R,
+) -> Result<EcPrivateKey, EcError> {
     // The key constructors below take an infallible `CryptoRng`, so RNG failure panics
     // rather than surfacing as an error.
-    let mut rng = UnwrapErr(SysRng);
+    let mut rng = UnwrapErr(RandomSourceRng(random));
 
     match curve {
         Curve::P256 => Ok(EcPrivateKey::P256(p256::SecretKey::generate_from_rng(
@@ -306,8 +311,8 @@ pub fn verify_ed25519(
     Ok(ed25519_dalek::Verifier::verify(public_key, data, &signature).is_ok())
 }
 
-pub fn generate_keypair(curve: Curve) -> Result<KeyPair, EcError> {
-    let secret = generate_private_key(curve)?;
+pub fn generate_keypair<R: RandomSource>(curve: Curve, random: &R) -> Result<KeyPair, EcError> {
+    let secret = generate_private_key(curve, random)?;
     let public = private_key_to_public(&secret)?;
     let secret = private_key_to_bytes(&secret)?;
     let public = pub_key_to_uncompressed(&public)?;
@@ -408,6 +413,7 @@ mod tests {
         test_utils::{byte_equal, get_test_public_keys, get_test_secret_keys},
         Curve, EcError,
     };
+    use crate::random::SystemRandom;
 
     use alloc::vec;
 
@@ -416,10 +422,10 @@ mod tests {
     #[test]
     fn private_key_can_be_generated() {
         SUPPORTED_CURVES.iter().copied().for_each(|curve| {
-            let one_key = generate_private_key(curve)
+            let one_key = generate_private_key(curve, &SystemRandom)
                 .unwrap_or_else(|e| panic!("Failed to generate private key for {curve:?} : {e:?}"));
 
-            let another_key = generate_private_key(curve)
+            let another_key = generate_private_key(curve, &SystemRandom)
                 .unwrap_or_else(|e| panic!("Failed to generate private key for {curve:?} : {e:?}"));
 
             assert_ne!(
@@ -434,7 +440,7 @@ mod tests {
     fn key_pair_can_be_generated() {
         SUPPORTED_CURVES.iter().copied().for_each(|curve| {
             assert_matches!(
-                generate_keypair(curve),
+                generate_keypair(curve, &SystemRandom),
                 Ok(_),
                 "Failed to generate key pair for {curve:?}"
             );
